@@ -118,7 +118,7 @@ scene.add(ground);
 // ---------- Parameters ----------
 const params = {
   width: 4, depth: 3, height: 3.5,
-  brickLength: 0.22, brickHeight: 0.07, brickDepth: 0.045, mortarGap: 0.012,
+  brickLength: 0.22, brickHeight: 0.07, brickDepth: 0.045, edgeExtraDepth: 0.025, mortarGap: 0.012,
   bondType: 'Running',
   randomness: 0.3,
   rotation: 0.15,
@@ -216,19 +216,22 @@ const csgMat = new THREE.MeshStandardMaterial({ color:0xb05a34, roughness:0.93, 
 const coreMat  = new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1 });
 const roofMat  = new THREE.MeshStandardMaterial({ color:0x3a2c24, roughness:1 });
 
-let brickMesh=null, clipBrickMesh=null, coreMesh=null, roofMesh=null;
-let lastMatrices=[], lastBrickGeo=null, lastClipGeo=null, importedMesh=null;
+let brickMesh=null, clipBrickMesh=null, edgeBrickMesh=null, coreMesh=null, roofMesh=null;
+let lastMatrices=[], lastEdgeMatrices=[], lastBrickGeo=null, lastClipGeo=null, importedMesh=null;
 let lastIslandMats=new Map();       // island id -> [Matrix4] for per-face STL export (ZBrush subtools)
-let lastIslandClipGeoms=new Map();  // island id -> clipped edge geometries for per-face STL export
+let lastIslandClipGeoms=new Map();  // island id -> clipped closure geometries for per-face STL export
+let lastIslandEdgeMats=new Map();   // island id -> full-size overlay edge-course bricks
 
 function build(){
   if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); if(brickMesh.dispose) brickMesh.dispose(); }
   if(clipBrickMesh){ scene.remove(clipBrickMesh); clipBrickMesh.geometry.dispose(); }
+  if(edgeBrickMesh){ scene.remove(edgeBrickMesh); edgeBrickMesh.geometry.dispose(); }
   if(coreMesh){ scene.remove(coreMesh); coreMesh.geometry.dispose(); }
   if(roofMesh){ scene.remove(roofMesh); roofMesh.geometry.dispose(); }
   for(const arr of lastIslandClipGeoms.values()) for(const g of arr) g.dispose();
   lastIslandClipGeoms.clear();
-  clipBrickMesh=null; lastClipGeo=null;
+  lastIslandEdgeMats.clear();
+  clipBrickMesh=null; edgeBrickMesh=null; lastClipGeo=null;
 
   const walls = buildWalls();
   const L=params.brickLength, Hb=params.brickHeight, T=params.brickDepth, g=params.mortarGap;
@@ -237,7 +240,7 @@ function build(){
   const rotMax = params.rotation * THREE.MathUtils.degToRad(16);
   const base = new THREE.Color(params.color);
 
-  const mats=[], cols=[], clipGeoms=[];
+  const mats=[], edgeMats=[], cols=[], edgeCols=[], clipGeoms=[];
   let clipBrickCount=0;
   let _curIslId=-1;            // which island the next placeIslandBrick() belongs to (for per-face export)
   const NORMAL_Z=new THREE.Vector3(0,0,1);
@@ -248,6 +251,15 @@ function build(){
       if(!arr){ arr=[]; lastIslandClipGeoms.set(_curIslId, arr); }
       arr.push(geo);
     }
+  }
+  function rememberEdgeMat(M){
+    edgeMats.push(M);
+    if(_curIslId>=0){
+      let arr=lastIslandEdgeMats.get(_curIslId);
+      if(!arr){ arr=[]; lastIslandEdgeMats.set(_curIslId, arr); }
+      arr.push(M);
+    }
+    const c=base.clone(); c.multiplyScalar(1.08); edgeCols.push(c);
   }
   const FRAME_PROUD = T*0.18;  // frame course only barely proud — enough to cap the seam, not extrude
 
@@ -328,6 +340,13 @@ function build(){
     if(_curIslId>=0){ const arr=lastIslandMats.get(_curIslId); if(arr) arr.push(M); }   // track for per-face STL export
     const c=base.clone(); c.multiplyScalar(1+(rnd()-0.5)*0.35*Math.max(0.25,params.randomness)); cols.push(c);
   }
+  function placeIslandEdgeBrick(P,u,v,N, ca,cb, bl,bh, phi){
+    const edgeT=T+Math.max(0, params.edgeExtraDepth||0);
+    const p3=P.clone().addScaledVector(u,ca).addScaledVector(v,cb).addScaledVector(N, edgeT*0.5+0.003);
+    const q=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(u,v,N));
+    if(phi) q.multiply(new THREE.Quaternion().setFromAxisAngle(NORMAL_Z, phi));
+    rememberEdgeMat(new THREE.Matrix4().compose(p3,q,new THREE.Vector3(bl,bh,edgeT)));
+  }
   // brick ONE normal-island: field bricks (per-face density) + an edge course framing its outline + holes
   function brickIsland(isl){
     _curIslId=isl.id; lastIslandMats.set(isl.id, []);          // start this face's own matrix list (per-face STL)
@@ -371,7 +390,8 @@ function build(){
         placeIslandBrick(P,u,v,N, (lA+hA)/2, (lB+hB)/2, cw, ch, 0, 0);
       }
     }
-    // EDGE COURSE: chain boundary into loops, march evenly, INSET inward so it sits inside the face
+    // EDGE COURSE: full-size overlay bricks on their own layer. Do not polygon-clip these:
+    // the field closures fill the face; this layer gives a clean, same-size edge brick course.
     if(isl.boundary && isl.boundary.length){
       const segs=isl.boundary.map(s=>{ const a=new THREE.Vector3().copy(s[0]).sub(P); const b=new THREE.Vector3().copy(s[1]).sub(P); return [[a.dot(u),a.dot(v)],[b.dot(u),b.dot(v)]]; });
       const qk=p=>Math.round(p[0]*400)+'|'+Math.round(p[1]*400);
@@ -395,14 +415,7 @@ function build(){
           const ox=nx*bh*0.5, oy=ny*bh*0.5;                           // inset the course half a brick so it sits inside the outline (no overhang onto neighbours)
           while(nextAt<=dist+len){
             const f=(nextAt-dist)/len, ca=a[0]+dx*f+ox, cb=a[1]+dy*f+oy;
-            const parts=clippedPolyParts(localBrickRect(ca,cb,bl,bh,ang),tris2,edgeInset);
-            let made=false;
-            for(const poly of parts){
-              const geo=prismFromLocalPoly(P,u,v,N,poly,T,0);
-              if(!geo) continue;
-              rememberClipGeo(geo); made=true;
-            }
-            if(made) clipBrickCount++;
+            placeIslandEdgeBrick(P,u,v,N,ca,cb,bl,bh,ang);
             nextAt+=bl;
           }
           dist+=len;
@@ -445,8 +458,9 @@ function build(){
     }
   }
 
-  const count = mats.length + clipBrickCount;
+  const count = mats.length + clipBrickCount + edgeMats.length;
   lastMatrices = mats;
+  lastEdgeMatrices = edgeMats;
   if(count===0){ brickMesh=null; lastBrickGeo=null; }
   else if(importedMesh && clipGeoms.length){
     const geoms=[];
@@ -458,7 +472,7 @@ function build(){
     brickMesh.castShadow=true; brickMesh.receiveShadow=true;
     lastBrickGeo=merged; scene.add(brickMesh);
   }
-  else if(csgReady){
+  else if(csgReady && !importedMesh){
     // merge all bricks (with per-brick vertex colour), then boolean-subtract each opening -> clean curved edges
     const geoms=[];
     for(let i=0;i<count;i++){ const gg=unitBox.clone(); gg.deleteAttribute('uv'); gg.applyMatrix4(mats[i]); geoms.push(gg); }
@@ -488,6 +502,14 @@ function build(){
       clipBrickMesh.castShadow=true; clipBrickMesh.receiveShadow=true;
       scene.add(clipBrickMesh);
     }
+  }
+  if(edgeMats.length){
+    edgeBrickMesh = new THREE.InstancedMesh(unitBox, brickMat, edgeMats.length);
+    edgeBrickMesh.castShadow = true; edgeBrickMesh.receiveShadow = true;
+    for(let i=0;i<edgeMats.length;i++){ edgeBrickMesh.setMatrixAt(i,edgeMats[i]); edgeBrickMesh.setColorAt(i,edgeCols[i]); }
+    edgeBrickMesh.instanceMatrix.needsUpdate = true;
+    if(edgeBrickMesh.instanceColor) edgeBrickMesh.instanceColor.needsUpdate = true;
+    scene.add(edgeBrickMesh);
   }
 
   if(importedMesh){
@@ -521,6 +543,7 @@ function exportSTL(){
     for(const mat of lastMatrices){ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); geoms.push(gg); }
     if(lastClipGeo){ const cg=lastClipGeo.clone(); if(cg.attributes.color) cg.deleteAttribute('color'); if(cg.attributes.uv) cg.deleteAttribute('uv'); geoms.push(cg); }
   }
+  for(const mat of lastEdgeMatrices) geoms.push(bakedBoxGeometry(mat));
   const cg=new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET);
   cg.translate(0, params.height/2, 0); if(cg.attributes.uv) cg.deleteAttribute('uv');
   geoms.push(cg);
@@ -538,11 +561,12 @@ function exportSTL(){
 
 // ---------- Per-face STL (one normal-island = one ZBrush subtool) ----------
 function faceSTLBlob(islId){
-  const arr=lastIslandMats.get(islId)||[], clipped=lastIslandClipGeoms.get(islId)||[];
-  if(!arr.length&&!clipped.length) return null;
+  const arr=lastIslandMats.get(islId)||[], clipped=lastIslandClipGeoms.get(islId)||[], edge=lastIslandEdgeMats.get(islId)||[];
+  if(!arr.length&&!clipped.length&&!edge.length) return null;
   const geoms=[];
-  for(const mat of arr) geoms.push(clipped.length ? bakedBoxGeometry(mat) : (()=>{ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); return gg; })());
+  for(const mat of arr) geoms.push((clipped.length||edge.length) ? bakedBoxGeometry(mat) : (()=>{ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); return gg; })());
   for(const src of clipped){ const gg=src.clone(); if(gg.attributes.color) gg.deleteAttribute('color'); if(gg.attributes.uv) gg.deleteAttribute('uv'); geoms.push(gg); }
+  for(const mat of edge) geoms.push(bakedBoxGeometry(mat));
   const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
   const data=new STLExporter().parse(new THREE.Mesh(merged),{binary:true});
   merged.dispose();
@@ -556,7 +580,7 @@ function exportFaceSTL(){
   downloadBlob(b,'face_'+focusedIsland+'.stl');
 }
 function exportAllFaces(){
-  const ids=[...selectedIslands].filter(id=>{ const a=lastIslandMats.get(id), b=lastIslandClipGeoms.get(id); return (a&&a.length)||(b&&b.length); });
+  const ids=[...selectedIslands].filter(id=>{ const a=lastIslandMats.get(id), b=lastIslandClipGeoms.get(id), c=lastIslandEdgeMats.get(id); return (a&&a.length)||(b&&b.length)||(c&&c.length); });
   if(!ids.length){ alert('No bricked faces to export — select some faces first.'); return; }
   ids.forEach((id,k)=> setTimeout(()=>{ const b=faceSTLBlob(id); if(b) downloadBlob(b,'face_'+id+'.stl'); }, k*350));   // stagger so the browser allows the multi-file download
 }
@@ -574,6 +598,7 @@ const fK = gui.addFolder('Brick');
 fK.add(params,'brickLength',0.08,0.40,0.005).name('Brick size (length)').onChange(rebuild);
 fK.add(params,'brickHeight',0.03,0.15,0.002).name('Brick height').onChange(rebuild);
 fK.add(params,'brickDepth',0.01,0.12,0.002).name('Brick depth (relief)').onChange(rebuild);
+fK.add(params,'edgeExtraDepth',0,0.12,0.002).name('Edge extra depth').onChange(rebuild);
 fK.add(params,'mortarGap',0,0.04,0.001).name('Mortar gap').onChange(rebuild);
 fK.add(params,'bondType',['Running','Stack','Wild']).name('Brick type / bond').onChange(rebuild);
 fK.add(params,'randomness',0,1,0.01).name('Randomness').onChange(rebuild);
