@@ -307,7 +307,7 @@ function build(){
   }
   // brick ONE normal-island: field bricks (per-face density) + an edge course framing its outline + holes
   function brickIsland(isl){
-    const dens=islandDensity.get(isl.id)||1, bl=L/dens, bh=Hb/dens;
+    const dens=(islandDensity.get(isl.id)||1)*(params.globalDensity||1), bl=L/dens, bh=Hb/dens;
     const N=isl.normal.clone();
     let v=new THREE.Vector3(0,1,0).addScaledVector(N,-N.y);    // world-up projected into the face plane
     if(v.lengthSq()<1e-4) v.set(1,0,0).addScaledVector(N,-N.x);
@@ -325,12 +325,29 @@ function build(){
         if(inside) placeIslandBrick(P,u,v,N, ca,cb, bl,bh, 0, 0);
       }
     }
-    if(isl.boundary) for(const seg of isl.boundary){            // EDGE COURSE along the island boundary
-      const pa=tmp.copy(seg[0]).sub(P); const A0=pa.dot(u), B0=pa.dot(v);
-      const pb=new THREE.Vector3().copy(seg[1]).sub(P); const A1=pb.dot(u), B1=pb.dot(v);
-      const dx=A1-A0, dy=B1-B0, len=Math.hypot(dx,dy); if(len<1e-4) continue;
-      const ang=Math.atan2(dy,dx), nB=Math.max(1,Math.round(len/bl));
-      for(let i=0;i<nB;i++){ const f=(i+0.5)/nB; placeIslandBrick(P,u,v,N, A0+dx*f, B0+dy*f, bl,bh, ang, bh*0.35); }
+    // EDGE COURSE: chain boundary into loops, march each placing a brick every ~bl (even spacing on curves)
+    if(isl.boundary && isl.boundary.length){
+      const segs=isl.boundary.map(s=>{ const a=new THREE.Vector3().copy(s[0]).sub(P); const b=new THREE.Vector3().copy(s[1]).sub(P); return [[a.dot(u),a.dot(v)],[b.dot(u),b.dot(v)]]; });
+      const qk=p=>Math.round(p[0]*400)+'|'+Math.round(p[1]*400);
+      const byPt=new Map(); segs.forEach((s,i)=>{ [0,1].forEach(e=>{ const k=qk(s[e]); if(!byPt.has(k))byPt.set(k,[]); byPt.get(k).push({i,e}); }); });
+      const usedS=new Array(segs.length).fill(false);
+      for(let i=0;i<segs.length;i++){
+        if(usedS[i]) continue;
+        const pts=[]; let cs=i, ce=0, guard=0;
+        while(cs>=0 && !usedS[cs] && guard++<segs.length+5){
+          usedS[cs]=true; const s=segs[cs];
+          if(pts.length===0) pts.push(s[ce]); pts.push(s[1-ce]);
+          const k=qk(s[1-ce]); const cand=(byPt.get(k)||[]).filter(c=>!usedS[c.i]);
+          if(cand.length){ cs=cand[0].i; ce=cand[0].e; } else cs=-1;
+        }
+        let dist=0, nextAt=bl/2;
+        for(let p=0;p<pts.length-1;p++){
+          const a=pts[p], b=pts[p+1], dx=b[0]-a[0], dy=b[1]-a[1], len=Math.hypot(dx,dy); if(len<1e-6) continue;
+          const ang=Math.atan2(dy,dx);
+          while(nextAt<=dist+len){ const f=(nextAt-dist)/len; placeIslandBrick(P,u,v,N, a[0]+dx*f, a[1]+dy*f, bl,bh, ang, bh*0.35); nextAt+=bl; }
+          dist+=len;
+        }
+      }
     }
   }
 
@@ -523,6 +540,28 @@ function computeIslands(geo){
     for(const rec of ec.values()) if(rec.c===1) boundary.push([new THREE.Vector3().fromBufferAttribute(pos,rec.a), new THREE.Vector3().fromBufferAttribute(pos,rec.b)]);
     importedIslands.push({id, tris:mem, normal:n.clone(), centroid:ctr.clone(), size:mem.length, boundary});
   }
+  // --- merge COPLANAR islands (T-junctions / split flat faces -> one face; drops internal seams) ---
+  const raw=importedIslands, grpOf=new Int32Array(raw.length).fill(-1), groups=[];
+  for(let i=0;i<raw.length;i++){
+    if(grpOf[i]>=0) continue;
+    const gid=groups.length; grpOf[i]=gid; const members=[i];
+    const ni=raw[i].normal, di=ni.dot(raw[i].centroid);
+    for(let j=i+1;j<raw.length;j++){ if(grpOf[j]<0 && ni.dot(raw[j].normal)>0.992 && Math.abs(raw[j].normal.dot(raw[j].centroid)-di)<0.04){ grpOf[j]=gid; members.push(j); } }
+    groups.push(members);
+  }
+  const merged=[], newOfTri=new Int32Array(islandOfTri.length);
+  for(let gid=0; gid<groups.length; gid++){
+    const tris=[]; for(const m of groups[gid]) for(const t of raw[m].tris){ tris.push(t); newOfTri[t]=gid; }
+    const n=new THREE.Vector3(), ctr=new THREE.Vector3();
+    for(const m of groups[gid]) n.add(raw[m].normal); n.normalize();
+    for(const t of tris) for(let k=0;k<3;k++) ctr.add(va.fromBufferAttribute(pos,t*3+k));
+    ctr.multiplyScalar(1/(tris.length*3));
+    const ec2=new Map();
+    for(const t of tris){ const idx=[t*3,t*3+1,t*3+2]; for(let e=0;e<3;e++){ const i0=idx[e],i1=idx[(e+1)%3]; const a=vk(i0),b=vk(i1); const k=a<b?a+'|'+b:b+'|'+a; let rec=ec2.get(k); if(!rec){rec={c:0,a:i0,b:i1};ec2.set(k,rec);} rec.c++; } }
+    const boundary=[]; for(const rec of ec2.values()) if(rec.c===1) boundary.push([new THREE.Vector3().fromBufferAttribute(pos,rec.a), new THREE.Vector3().fromBufferAttribute(pos,rec.b)]);
+    merged.push({id:gid, tris, normal:n.clone(), centroid:ctr.clone(), size:tris.length, boundary});
+  }
+  importedIslands=merged; islandOfTri=newOfTri;
 }
 function highlightIslands(){
   if(!importedMesh||!islandOfTri) return;
@@ -552,10 +591,20 @@ function setupPicking(){
     if(!hit.length||islandOfTri==null) return;
     const isl=islandOfTri[hit[0].faceIndex];
     if(isl<0) return;
-    if(selectedIslands.has(isl)) selectedIslands.delete(isl); else selectedIslands.add(isl);
-    focusedIsland=isl;
-    if(faceDensCtrl){ params.faceDensity = islandDensity.get(isl)||1; faceDensCtrl.updateDisplay(); }
+    if(selectedIslands.has(isl)) selectedIslands.delete(isl); else selectedIslands.add(isl);   // single click = on/off
     highlightIslands(); build();
+  });
+  el.addEventListener('dblclick', e=>{                          // double click = pick this face for density editing
+    if(!importedMesh) return;
+    const r=el.getBoundingClientRect();
+    _ndc.x=((e.clientX-r.left)/r.width)*2-1; _ndc.y=-((e.clientY-r.top)/r.height)*2+1;
+    _ray.setFromCamera(_ndc, camera);
+    const hit=_ray.intersectObject(importedMesh,false);
+    if(!hit.length||islandOfTri==null) return;
+    const isl=islandOfTri[hit[0].faceIndex]; if(isl<0) return;
+    focusedIsland=isl;
+    if(faceDensCtrl){ params.faceDensity=islandDensity.get(isl)||1; faceDensCtrl.updateDisplay(); }
+    highlightIslands();
   });
 }
 
@@ -601,8 +650,9 @@ fIm.add({ ry: ()=>{ importRot.y=(importRot.y+1)%4; reprocessImport(); } }, 'ry')
 fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz').name('⟳  Rotate Z 90°');
 fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.5) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select all walls');
 fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIsland=-1; highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear faces');
-params.faceDensity=1;
-faceDensCtrl = fIm.add(params,'faceDensity',0.4,3,0.05).name('Clicked-face density ×').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
+params.globalDensity=1; params.faceDensity=1;
+fIm.add(params,'globalDensity',0.4,3,0.05).name('Global density ×').onChange(()=>{ if(importedMesh) build(); });
+faceDensCtrl = fIm.add(params,'faceDensity',0.3,3,0.05).name('Sel-face density × (dbl-click)').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
