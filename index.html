@@ -267,9 +267,37 @@ function build(){
     return {cu:(a0+a1)/2, cv:(b0+b1)/2, sx:a1-a0, sy:b1-b0};
   }
 
+  const raycaster = new THREE.Raycaster();
+  function placeClad(wall, baseQuat, u, v, nCoord){
+    const q=baseQuat.clone();
+    if(rotMax>0) q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((rnd()-0.5)*rotMax*0.5,(rnd()-0.5)*rotMax*0.5,(rnd()-0.5)*rotMax*0.5)));
+    const pos=new THREE.Vector3().copy(wall.origin).addScaledVector(wall.uDir,u).addScaledVector(wall.vDir,v).addScaledVector(wall.normal,nCoord);
+    mats.push(new THREE.Matrix4().compose(pos,q,new THREE.Vector3(L,Hb,T)));
+    cols.push(base.clone());
+  }
+  // clad an imported mesh by raycasting each grid cell onto its real surface (follows silhouette + depth, skips empty)
+  function cladByRaycast(wall, baseQuat){
+    const stepU=L+g, stepV=Hb+g, out=Math.max(params.width,params.depth,params.height)+0.5;
+    const dir=wall.normal.clone().negate(), o=new THREE.Vector3();
+    const rows=Math.ceil(wall.vLen/stepV)+1, ncol=Math.ceil(wall.uLen/stepU)+1;
+    for(let r=0;r<rows;r++){
+      const v=r*stepV + Hb/2; if(v>wall.vLen) break;
+      const off=(r%2)*(stepU/2);
+      for(let c=0;c<ncol;c++){
+        const u=off + c*stepU + L/2; if(u>wall.uLen) continue;
+        o.copy(wall.origin).addScaledVector(wall.uDir,u).addScaledVector(wall.vDir,v).addScaledVector(wall.normal,out);
+        raycaster.set(o, dir);
+        const hit=raycaster.intersectObject(importedMesh, false);
+        if(!hit.length) continue;
+        placeClad(wall, baseQuat, u, v, (out - hit[0].distance) + T*0.5);
+      }
+    }
+  }
+
   for(const wall of walls){
     const basis=new THREE.Matrix4().makeBasis(wall.uDir, wall.vDir, wall.normal);
     const baseQuat=new THREE.Quaternion().setFromRotationMatrix(basis);
+    if(importedMesh){ cladByRaycast(wall, baseQuat); continue; }
 
     // FIELD: running bond across the whole wall, every brick clipped to fit the wall + openings (no gaps)
     const rows=Math.floor(wall.vLen/stepV)+1;
@@ -412,15 +440,17 @@ function loadSTL(buffer, name){
   geo.computeBoundingBox(); geo.boundingBox.getSize(size);
   geo.translate(0, size.y/2, 0);                              // sit it on the ground
   if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); }
-  importedMesh = new THREE.Mesh(geo, coreMat);
+  importedMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1, side:THREE.DoubleSide }));
   importedMesh.castShadow=true; importedMesh.receiveShadow=true;
   scene.add(importedMesh);
   params.width=size.x; params.depth=size.z; params.height=size.y;   // clad its bounding box
   build();
   document.getElementById('info').innerHTML = '<b>Imported:</b> '+(name||'model.stl')+'<br>Bricks clad its bounding box. Hit <b>Use sample building</b> to go back.';
 }
+function loadExample(){ fetch('sample-building.stl').then(r=>r.arrayBuffer()).then(b=>loadSTL(b,'example building')).catch(e=>{ console.error(e); alert('Could not load the example building file.'); }); }
 const fIm = gui.addFolder('Import');
 fIm.add({ pick: ()=>fileInput.click() }, 'pick').name('⬆  Import STL…');
+fIm.add({ ex: loadExample }, 'ex').name('🏠  Load example building');
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
