@@ -323,16 +323,22 @@ function build(){
     const stepU=bl+g, stepV=bh+g; let row=0;
     const tb=tris2.map(t=>[Math.min(t[0][0],t[1][0],t[2][0]),Math.max(t[0][0],t[1][0],t[2][0]),Math.min(t[0][1],t[1][1],t[2][1]),Math.max(t[0][1],t[1][1],t[2][1])]);
     const inIsland=(a,b)=>{ for(let i=0;i<tris2.length;i++){ const x=tb[i]; if(a<x[0]||a>x[1]||b<x[2]||b>x[3]) continue; if(pointInTri2D(a,b,tris2[i])) return true; } return false; };
-    // FIELD: each brick CLIPPED to the face outline (closure bricks -> fills to the edge, never overhangs)
+    // FIELD: a cell fully inside the face gets a FULL-size brick (so mortar gap 0 => bricks touch, no false gaps);
+    //        a cell straddling the outline gets a CLOSURE brick clipped to the inside samples only (trims UNDER the
+    //        surface, never pokes past it). m = a hair of extra inset on closures so no edge shows on the original mesh.
+    const NX=6,NY=4, m=bl*0.04;
     for(let bb=minB; bb<maxB; bb+=stepV, row++){
       const off=(row%2)*(stepU/2);
       for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
-        const a0=aa,b0=bb, NX=5,NY=3; let mnA=1e9,mxA=-1e9,mnB=1e9,mxB=-1e9,any=false;
+        const a0=aa,b0=bb; let cnt=0, mnA=1e9,mxA=-1e9,mnB=1e9,mxB=-1e9;
         for(let ix=0;ix<NX;ix++)for(let jy=0;jy<NY;jy++){ const sa=a0+(ix+0.5)/NX*bl, sb=b0+(jy+0.5)/NY*bh;
-          if(inIsland(sa,sb)){ any=true; if(sa<mnA)mnA=sa;if(sa>mxA)mxA=sa;if(sb<mnB)mnB=sb;if(sb>mxB)mxB=sb; } }
-        if(!any) continue;
-        const cw=mxA-mnA, ch=mxB-mnB; if(cw<bl*0.12||ch<bh*0.12) continue;
-        placeIslandBrick(P,u,v,N, (mnA+mxA)/2, (mnB+mxB)/2, cw, ch, 0, 0);
+          if(inIsland(sa,sb)){ cnt++; if(sa<mnA)mnA=sa;if(sa>mxA)mxA=sa;if(sb<mnB)mnB=sb;if(sb>mxB)mxB=sb; } }
+        if(!cnt) continue;
+        let lA,hA,lB,hB;
+        if(cnt===NX*NY){ lA=a0; hA=a0+bl; lB=b0; hB=b0+bh; }                  // fully inside -> FULL brick (no gap)
+        else { lA=mnA+m; hA=mxA-m; lB=mnB+m*0.5; hB=mxB-m*0.5; }              // edge -> clip inside + trim a touch more
+        const cw=hA-lA, ch=hB-lB; if(cw<bl*0.1||ch<bh*0.1) continue;
+        placeIslandBrick(P,u,v,N, (lA+hA)/2, (lB+hB)/2, cw, ch, 0, 0);
       }
     }
     // EDGE COURSE: chain boundary into loops, march evenly, INSET inward so it sits inside the face
@@ -679,6 +685,7 @@ fIm.add({ rx: ()=>{ importRot.x=(importRot.x+1)%4; reprocessImport(); } }, 'rx')
 fIm.add({ ry: ()=>{ importRot.y=(importRot.y+1)%4; reprocessImport(); } }, 'ry').name('⟳  Rotate Y 90°');
 fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz').name('⟳  Rotate Z 90°');
 fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.85 && i.area>0.03 && i.maxDev<0.2) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select walls + roof');
+fIm.add({ selAll:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selAll').name('▣  Select ALL faces (global density)');
 fIm.add({ rm:()=>{ if(focusedIsland>=0){ selectedIslands.delete(focusedIsland); highlightIslands(); build(); } } }, 'rm').name('✕  Remove clicked face');
 fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIsland=-1; highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear all faces');
 params.globalDensity=1; params.faceDensity=1;
