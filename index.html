@@ -118,7 +118,7 @@ scene.add(ground);
 // ---------- Parameters ----------
 const params = {
   width: 4, depth: 3, height: 3.5,
-  brickLength: 0.22, brickHeight: 0.07, brickDepth: 0.045, edgeExtraDepth: 0.025, mortarGap: 0.012,
+  brickLength: 0.22, brickHeight: 0.07, brickDepth: 0.045, edgeExtraDepth: 0.025, faceEdgeExtraDepth: 0.025, mortarGap: 0.012,
   bondType: 'Running',
   randomness: 0.3,
   rotation: 0.15,
@@ -341,7 +341,8 @@ function build(){
     const c=base.clone(); c.multiplyScalar(1+(rnd()-0.5)*0.35*Math.max(0.25,params.randomness)); cols.push(c);
   }
   function placeIslandEdgeBrick(P,u,v,N, ca,cb, bl,bh, phi){
-    const edgeT=T+Math.max(0, params.edgeExtraDepth||0);
+    const edgeExtra=(_curIslId>=0 && islandEdgeExtraDepth.has(_curIslId)) ? islandEdgeExtraDepth.get(_curIslId) : params.edgeExtraDepth;
+    const edgeT=T+Math.max(0, edgeExtra||0);
     const p3=P.clone().addScaledVector(u,ca).addScaledVector(v,cb).addScaledVector(N, edgeT*0.5+0.003);
     const q=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(u,v,N));
     if(phi) q.multiply(new THREE.Quaternion().setFromAxisAngle(NORMAL_Z, phi));
@@ -366,7 +367,12 @@ function build(){
     // of using sample-point shrink boxes, so roof/window edges fill cleanly without spilling onto neighbours.
     const NX=6,NY=4, edgeInset=Math.min(bl,bh)*0.015;
     for(let bb=minB; bb<maxB; bb+=stepV, row++){
-      const off=(row%2)*(stepU/2);
+      let off=0;
+      if(params.bondType==='Running') off=(row%2)*(stepU/2);
+      else if(params.bondType==='Wild'){
+        const r=Math.sin((isl.id+1)*12.9898+(row+1)*78.233)*43758.5453;
+        off=(r-Math.floor(r))*stepU;
+      }
       for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
         const a0=aa,b0=bb; let cnt=0, mnA=1e9,mxA=-1e9,mnB=1e9,mxB=-1e9;
         for(let ix=0;ix<NX;ix++)for(let jy=0;jy<NY;jy++){ const sa=a0+(ix+0.5)/NX*bl, sb=b0+(jy+0.5)/NY*bh;
@@ -598,7 +604,7 @@ const fK = gui.addFolder('Brick');
 fK.add(params,'brickLength',0.08,0.40,0.005).name('Brick size (length)').onChange(rebuild);
 fK.add(params,'brickHeight',0.03,0.15,0.002).name('Brick height').onChange(rebuild);
 fK.add(params,'brickDepth',0.01,0.12,0.002).name('Brick depth (relief)').onChange(rebuild);
-fK.add(params,'edgeExtraDepth',0,0.12,0.002).name('Edge extra depth').onChange(rebuild);
+fK.add(params,'edgeExtraDepth',0,0.12,0.002).name('Edge extra depth').onChange(v=>{ if(focusedIsland<0||!islandEdgeExtraDepth.has(focusedIsland)){ params.faceEdgeExtraDepth=v; if(faceEdgeCtrl) faceEdgeCtrl.updateDisplay(); } rebuild(); });
 fK.add(params,'mortarGap',0,0.04,0.001).name('Mortar gap').onChange(rebuild);
 fK.add(params,'bondType',['Running','Stack','Wild']).name('Brick type / bond').onChange(rebuild);
 fK.add(params,'randomness',0,1,0.01).name('Randomness').onChange(rebuild);
@@ -625,7 +631,8 @@ let importedIslands=[];           // [{id, tris:[triIdx], normal, centroid, size
 let islandOfTri=null;             // Int32Array: tri -> island id
 const selectedIslands=new Set();  // island ids that get bricks
 const islandDensity=new Map();    // island id -> per-face density multiplier (default 1)
-let focusedIsland=-1, faceDensCtrl=null;
+const islandEdgeExtraDepth=new Map(); // island id -> per-face edge overlay extra depth
+let focusedIsland=-1, faceDensCtrl=null, faceEdgeCtrl=null;
 let pickingSetup=false, _downXY=null;
 const _ray=new THREE.Raycaster(), _ndc=new THREE.Vector2();
 function pointInTri2D(px,py,t){
@@ -808,6 +815,7 @@ function setupPicking(){
     if(selectedIslands.has(isl)) selectedIslands.delete(isl); else selectedIslands.add(isl);   // single click toggles bricks on/off
     focusedIsland=isl;                                            // ...and focuses it for the density slider
     if(faceDensCtrl){ params.faceDensity=islandDensity.get(isl)||1; faceDensCtrl.updateDisplay(); }
+    if(faceEdgeCtrl){ params.faceEdgeExtraDepth=islandEdgeExtraDepth.has(isl)?islandEdgeExtraDepth.get(isl):params.edgeExtraDepth; faceEdgeCtrl.updateDisplay(); }
     highlightIslands(); build();
   });
 }
@@ -831,6 +839,13 @@ function reprocessImport(name){
   scene.add(importedMesh);
   computeIslands(geo);
   selectedIslands.clear();
+  islandDensity.clear();
+  islandEdgeExtraDepth.clear();
+  focusedIsland=-1;
+  params.faceDensity=1;
+  params.faceEdgeExtraDepth=params.edgeExtraDepth;
+  if(faceDensCtrl) faceDensCtrl.updateDisplay();
+  if(faceEdgeCtrl) faceEdgeCtrl.updateDisplay();
   for(const isl of importedIslands) if(Math.abs(isl.normal.y)<0.85 && isl.area>0.03 && isl.maxDev<0.2) selectedIslands.add(isl.id);  // FLAT, non-horizontal faces (walls+roof); skip floor/ceiling + curved window reveals
   setupPicking(); highlightIslands();
   params.width=size.x; params.depth=size.z; params.height=size.y;
@@ -855,10 +870,22 @@ fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz')
 fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.85 && i.area>0.03 && i.maxDev<0.2) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select walls + roof');
 fIm.add({ selAll:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selAll').name('▣  Select ALL faces (global density)');
 fIm.add({ rm:()=>{ if(focusedIsland>=0){ selectedIslands.delete(focusedIsland); highlightIslands(); build(); } } }, 'rm').name('✕  Remove clicked face');
-fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIsland=-1; highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear all faces');
-params.globalDensity=1; params.faceDensity=1;
+fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); islandEdgeExtraDepth.clear(); focusedIsland=-1; params.faceEdgeExtraDepth=params.edgeExtraDepth; if(faceEdgeCtrl) faceEdgeCtrl.updateDisplay(); highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear all faces');
+params.globalDensity=1; params.faceDensity=1; params.faceEdgeExtraDepth=params.edgeExtraDepth;
 fIm.add(params,'globalDensity',0.4,3,0.05).name('Global density ×').onChange(()=>{ if(importedMesh) build(); });
 faceDensCtrl = fIm.add(params,'faceDensity',0.3,3,0.05).name('Clicked-face density ×').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
+function setFocusedEdgeDepth(v){
+  if(focusedIsland<0) return;
+  const nv=Math.max(0,Math.min(0.12,v));
+  islandEdgeExtraDepth.set(focusedIsland,nv);
+  params.faceEdgeExtraDepth=nv;
+  if(faceEdgeCtrl) faceEdgeCtrl.updateDisplay();
+  build();
+}
+faceEdgeCtrl = fIm.add(params,'faceEdgeExtraDepth',0,0.12,0.002).name('Clicked-edge depth').onChange(v=>setFocusedEdgeDepth(v));
+fIm.add({ edgeMinus:()=>setFocusedEdgeDepth((focusedIsland>=0?params.faceEdgeExtraDepth:params.edgeExtraDepth)-0.01) }, 'edgeMinus').name('−  Edge depth');
+fIm.add({ edgePlus:()=>setFocusedEdgeDepth((focusedIsland>=0?params.faceEdgeExtraDepth:params.edgeExtraDepth)+0.01) }, 'edgePlus').name('+  Edge depth');
+fIm.add({ edgeReset:()=>{ if(focusedIsland>=0){ islandEdgeExtraDepth.delete(focusedIsland); params.faceEdgeExtraDepth=params.edgeExtraDepth; if(faceEdgeCtrl) faceEdgeCtrl.updateDisplay(); build(); } } }, 'edgeReset').name('↺  Reset clicked edge');
 fIm.add({ ef: exportFaceSTL }, 'ef').name('⬇  Export clicked face (STL)');
 fIm.add({ ea: exportAllFaces }, 'ea').name('⬇  Export each face separately (ZBrush)');
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
