@@ -85,8 +85,7 @@ const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 renderer.setSize(innerWidth, innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.enabled = false;   // no shadows (distracting)
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -559,7 +558,9 @@ function computeIslands(geo){
     const ec2=new Map();
     for(const t of tris){ const idx=[t*3,t*3+1,t*3+2]; for(let e=0;e<3;e++){ const i0=idx[e],i1=idx[(e+1)%3]; const a=vk(i0),b=vk(i1); const k=a<b?a+'|'+b:b+'|'+a; let rec=ec2.get(k); if(!rec){rec={c:0,a:i0,b:i1};ec2.set(k,rec);} rec.c++; } }
     const boundary=[]; for(const rec of ec2.values()) if(rec.c===1) boundary.push([new THREE.Vector3().fromBufferAttribute(pos,rec.a), new THREE.Vector3().fromBufferAttribute(pos,rec.b)]);
-    merged.push({id:gid, tris, normal:n.clone(), centroid:ctr.clone(), size:tris.length, boundary});
+    let area=0; const _a=new THREE.Vector3(),_b=new THREE.Vector3(),_c=new THREE.Vector3(),_e1=new THREE.Vector3(),_e2=new THREE.Vector3();
+    for(const t of tris){ _a.fromBufferAttribute(pos,t*3);_b.fromBufferAttribute(pos,t*3+1);_c.fromBufferAttribute(pos,t*3+2); _e1.subVectors(_b,_a);_e2.subVectors(_c,_a); area+=0.5*_e1.cross(_e2).length(); }
+    merged.push({id:gid, tris, normal:n.clone(), centroid:ctr.clone(), size:tris.length, area, boundary});
   }
   importedIslands=merged; islandOfTri=newOfTri;
 }
@@ -591,20 +592,9 @@ function setupPicking(){
     if(!hit.length||islandOfTri==null) return;
     const isl=islandOfTri[hit[0].faceIndex];
     if(isl<0) return;
-    if(selectedIslands.has(isl)) selectedIslands.delete(isl); else selectedIslands.add(isl);   // single click = on/off
-    highlightIslands(); build();
-  });
-  el.addEventListener('dblclick', e=>{                          // double click = pick this face for density editing
-    if(!importedMesh) return;
-    const r=el.getBoundingClientRect();
-    _ndc.x=((e.clientX-r.left)/r.width)*2-1; _ndc.y=-((e.clientY-r.top)/r.height)*2+1;
-    _ray.setFromCamera(_ndc, camera);
-    const hit=_ray.intersectObject(importedMesh,false);
-    if(!hit.length||islandOfTri==null) return;
-    const isl=islandOfTri[hit[0].faceIndex]; if(isl<0) return;
-    focusedIsland=isl;
+    selectedIslands.add(isl); focusedIsland=isl;                 // single click = select this face + focus it for density
     if(faceDensCtrl){ params.faceDensity=islandDensity.get(isl)||1; faceDensCtrl.updateDisplay(); }
-    highlightIslands();
+    highlightIslands(); build();
   });
 }
 
@@ -627,11 +617,11 @@ function reprocessImport(name){
   scene.add(importedMesh);
   computeIslands(geo);
   selectedIslands.clear();
-  for(const isl of importedIslands) if(Math.abs(isl.normal.y)<0.5 && isl.size>=2) selectedIslands.add(isl.id);  // auto-pick wall faces
+  for(const isl of importedIslands) if(Math.abs(isl.normal.y)<0.5 && isl.area>0.06) selectedIslands.add(isl.id);  // auto-pick LARGE wall faces (skip tiny hole rims)
   setupPicking(); highlightIslands();
   params.width=size.x; params.depth=size.z; params.height=size.y;
   build();
-  if(name) document.getElementById('info').innerHTML = '<b>Imported:</b> '+name+'<br>Rotate to stand it up · <b>CLICK a face</b> to toggle its bricks (green = on).';
+  if(name) document.getElementById('info').innerHTML = '<b>Imported:</b> '+name+'<br>Click a face to select it (green) + set its density · ✕ to remove.';
 }
 function loadSTL(buffer, name){
   const geo = stlLoader.parse(buffer);
@@ -648,11 +638,12 @@ fIm.add({ ex: loadExample }, 'ex').name('🏠  Load example building');
 fIm.add({ rx: ()=>{ importRot.x=(importRot.x+1)%4; reprocessImport(); } }, 'rx').name('⟳  Rotate X 90°');
 fIm.add({ ry: ()=>{ importRot.y=(importRot.y+1)%4; reprocessImport(); } }, 'ry').name('⟳  Rotate Y 90°');
 fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz').name('⟳  Rotate Z 90°');
-fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.5) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select all walls');
-fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIsland=-1; highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear faces');
+fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.5 && i.area>0.06) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select all walls');
+fIm.add({ rm:()=>{ if(focusedIsland>=0){ selectedIslands.delete(focusedIsland); highlightIslands(); build(); } } }, 'rm').name('✕  Remove clicked face');
+fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIsland=-1; highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear all faces');
 params.globalDensity=1; params.faceDensity=1;
 fIm.add(params,'globalDensity',0.4,3,0.05).name('Global density ×').onChange(()=>{ if(importedMesh) build(); });
-faceDensCtrl = fIm.add(params,'faceDensity',0.3,3,0.05).name('Sel-face density × (dbl-click)').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
+faceDensCtrl = fIm.add(params,'faceDensity',0.3,3,0.05).name('Clicked-face density ×').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
