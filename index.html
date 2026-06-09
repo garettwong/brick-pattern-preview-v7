@@ -235,6 +235,7 @@ function build(){
 
   const walls = buildWalls();
   const L=params.brickLength, Hb=params.brickHeight, T=params.brickDepth, g=params.mortarGap;
+  const SKIN=Math.max(0.005,T*0.12);   // imported bricks float a hair proud of the core so their backs don't z-fight the green surface
   const stepU=L+g, stepV=Hb+g;
   const rnd = mulberry32(1337);
   const rotMax = params.rotation * THREE.MathUtils.degToRad(16);
@@ -330,7 +331,7 @@ function build(){
   // place a brick on an island plane at local (ca,cb); phi = in-plane length angle, proud = extra relief
   function placeIslandBrick(P,u,v,N, ca,cb, bl,bh, phi, proud){
     const jn=(rnd()-0.5)*T*0.4*params.randomness;
-    const p3=P.clone().addScaledVector(u,ca).addScaledVector(v,cb).addScaledVector(N, T*0.5+proud+jn);
+    const p3=P.clone().addScaledVector(u,ca).addScaledVector(v,cb).addScaledVector(N, T*0.5+SKIN+proud+jn);
     const q=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(u,v,N));
     if(phi) q.multiply(new THREE.Quaternion().setFromAxisAngle(NORMAL_Z, phi));
     if(rotMax>0) q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax)));
@@ -360,49 +361,66 @@ function build(){
     const P=isl.centroid, pos=importedMesh.geometry.attributes.position, tmp=new THREE.Vector3();
     const tris2=[]; let minA=1e9,maxA=-1e9,minB=1e9,maxB=-1e9;
     for(const t of isl.tris){ const tri=[]; for(let k=0;k<3;k++){ tmp.fromBufferAttribute(pos,t*3+k).sub(P); const a=tmp.dot(u),b=tmp.dot(v); tri.push([a,b]); if(a<minA)minA=a;if(a>maxA)maxA=a;if(b<minB)minB=b;if(b>maxB)maxB=b; } tris2.push(tri); }
-    const stepU=bl+g, stepV=bh+g; let row=0;
+    const stepU=bl+g, stepV=bh+g;
     const tb=tris2.map(t=>[Math.min(t[0][0],t[1][0],t[2][0]),Math.max(t[0][0],t[1][0],t[2][0]),Math.min(t[0][1],t[1][1],t[2][1]),Math.max(t[0][1],t[1][1],t[2][1])]);
     const inIsland=(a,b)=>{ for(let i=0;i<tris2.length;i++){ const x=tb[i]; if(a<x[0]||a>x[1]||b<x[2]||b>x[3]) continue; if(pointInTri2D(a,b,tris2[i])) return true; } return false; };
-    // FIELD: full cells stay full-size. Edge cells are clipped against the real STL triangles instead
-    // of using sample-point shrink boxes, so roof/window edges fill cleanly without spilling onto neighbours.
-    const NX=6,NY=4, edgeInset=Math.min(bl,bh)*0.015;
-    for(let bb=minB; bb<maxB; bb+=stepV, row++){
+    // BOUNDARY SEGMENTS (2D) + INWARD normals (toward the face material). Bricks are clipped to these so they
+    // FILL right up to the real outline yet never poke past it onto a neighbouring face (the "brick from another
+    // wall showing on the roof" problem). This is the "trim by the actual geometry, with a small offset" step.
+    const bsegs=[];
+    if(isl.boundary) for(const sgmt of isl.boundary){
+      const a=new THREE.Vector3().copy(sgmt[0]).sub(P), b=new THREE.Vector3().copy(sgmt[1]).sub(P);
+      const a2=[a.dot(u),a.dot(v)], b2=[b.dot(u),b.dot(v)];
+      const dx=b2[0]-a2[0], dy=b2[1]-a2[1], len=Math.hypot(dx,dy); if(len<1e-7) continue;
+      let nx=-dy/len, ny=dx/len; const e=Math.min(bl,bh)*0.5;
+      if(!inIsland((a2[0]+b2[0])/2+nx*e,(a2[1]+b2[1])/2+ny*e)){ nx=-nx; ny=-ny; }   // aim the normal INWARD
+      bsegs.push({a:a2,b:b2,nx,ny, lo0:Math.min(a2[0],b2[0]),lo1:Math.min(a2[1],b2[1]),hi0:Math.max(a2[0],b2[0]),hi1:Math.max(a2[1],b2[1])});
+    }
+    // clip a convex polygon against every NEARBY boundary segment, each half-plane pushed inward by `inset`.
+    // interior bricks (no boundary near) pass through unchanged; boundary bricks come back trimmed to the silhouette.
+    function clipToBoundary(poly, inset){
+      let lo0=1e9,lo1=1e9,hi0=-1e9,hi1=-1e9;
+      for(const p of poly){ if(p[0]<lo0)lo0=p[0]; if(p[1]<lo1)lo1=p[1]; if(p[0]>hi0)hi0=p[0]; if(p[1]>hi1)hi1=p[1]; }
+      const mg=inset+Math.min(bl,bh)*0.06; let out=poly;
+      for(const s of bsegs){
+        if(s.hi0<lo0-mg||s.lo0>hi0+mg||s.hi1<lo1-mg||s.lo1>hi1+mg) continue;        // this segment isn't near the brick
+        const ax=s.a[0]+s.nx*inset, ay=s.a[1]+s.ny*inset, bx=s.b[0]+s.nx*inset, by=s.b[1]+s.ny*inset; // boundary line, offset inward
+        const inside=p=>s.nx*(p[0]-ax)+s.ny*(p[1]-ay)>=-1e-7, np=[];
+        for(let i=0;i<out.length;i++){
+          const p=out[i], q=out[(i+1)%out.length], pi=inside(p), qi=inside(q);
+          if(pi) np.push(p);
+          if(pi!==qi) np.push(clipLine2D(p,q,[ax,ay],[bx,by]));
+        }
+        out=np; if(out.length<3) return null;
+      }
+      return out.length>=3?out:null;
+    }
+    // FIELD: interior cells -> a FULL brick (mortar gap 0 => they touch). Boundary cells -> a closure brick
+    // clipped to the real silhouette (fills the edge cleanly, never spills onto the neighbour face).
+    const NX=5,NY=4, fieldInset=Math.min(bl,bh)*0.04;
+    for(let bb=minB,row=0; bb<maxB; bb+=stepV, row++){
       let off=0;
       if(params.bondType==='Running') off=(row%2)*(stepU/2);
-      else if(params.bondType==='Wild'){
-        const r=Math.sin((isl.id+1)*12.9898+(row+1)*78.233)*43758.5453;
-        off=(r-Math.floor(r))*stepU;
-      }
+      else if(params.bondType==='Wild'){ const r=Math.sin((isl.id+1)*12.9898+(row+1)*78.233)*43758.5453; off=(r-Math.floor(r))*stepU; }
       for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
-        const a0=aa,b0=bb; let cnt=0, mnA=1e9,mxA=-1e9,mnB=1e9,mxB=-1e9;
-        for(let ix=0;ix<NX;ix++)for(let jy=0;jy<NY;jy++){ const sa=a0+(ix+0.5)/NX*bl, sb=b0+(jy+0.5)/NY*bh;
-          if(inIsland(sa,sb)){ cnt++; if(sa<mnA)mnA=sa;if(sa>mxA)mxA=sa;if(sb<mnB)mnB=sb;if(sb>mxB)mxB=sb; } }
+        const a0=aa,b0=bb; let cnt=0;
+        for(let ix=0;ix<NX;ix++)for(let jy=0;jy<NY;jy++){ if(inIsland(a0+(ix+0.5)/NX*bl,b0+(jy+0.5)/NY*bh)) cnt++; }
         if(!cnt) continue;
-        let lA,hA,lB,hB;
-        const fullCell=cnt===NX*NY && inIsland(a0,b0) && inIsland(a0+bl,b0) && inIsland(a0+bl,b0+bh) && inIsland(a0,b0+bh);
-        if(fullCell){ lA=a0; hA=a0+bl; lB=b0; hB=b0+bh; }                    // fully inside -> FULL brick (no gap)
-        else {
-          const parts=clippedBrickParts(a0,b0,a0+bl,b0+bh,tris2,edgeInset);
-          let made=false;
-          for(const poly of parts){
-            const geo=prismFromLocalPoly(P,u,v,N,poly,T,0);
-            if(!geo) continue;
-            rememberClipGeo(geo); made=true;
-          }
-          if(made) clipBrickCount++;
-          continue;
-        }
-        const cw=hA-lA, ch=hB-lB; if(cw<bl*0.1||ch<bh*0.1) continue;
-        placeIslandBrick(P,u,v,N, (lA+hA)/2, (lB+hB)/2, cw, ch, 0, 0);
+        const fullCell=cnt===NX*NY && inIsland(a0,b0)&&inIsland(a0+bl,b0)&&inIsland(a0+bl,b0+bh)&&inIsland(a0,b0+bh);
+        if(fullCell){ placeIslandBrick(P,u,v,N,a0+bl/2,b0+bh/2,bl,bh,0,0); continue; }   // interior -> full instanced brick
+        const clipped=clipToBoundary([[a0,b0],[a0+bl,b0],[a0+bl,b0+bh],[a0,b0+bh]], fieldInset);
+        if(clipped){ const geo=prismFromLocalPoly(P,u,v,N,clipped,T,SKIN); if(geo){ rememberClipGeo(geo); clipBrickCount++; } }
       }
     }
-    // EDGE COURSE: full-size overlay bricks on their own layer. Do not polygon-clip these:
-    // the field closures fill the face; this layer gives a clean, same-size edge brick course.
-    if(isl.boundary && isl.boundary.length){
-      const segs=isl.boundary.map(s=>{ const a=new THREE.Vector3().copy(s[0]).sub(P); const b=new THREE.Vector3().copy(s[1]).sub(P); return [[a.dot(u),a.dot(v)],[b.dot(u),b.dot(v)]]; });
+    // EDGE COURSE: a brick course following the outline, each brick CLIPPED to the face (a bit more inset) so it
+    // frames the edge cleanly but NEVER spills past the silhouette. Carries the per-face "edge depth" relief.
+    if(bsegs.length){
+      const segs=bsegs.map(s=>[s.a,s.b]);
       const qk=p=>Math.round(p[0]*400)+'|'+Math.round(p[1]*400);
       const byPt=new Map(); segs.forEach((s,i)=>{ [0,1].forEach(e=>{ const k=qk(s[e]); if(!byPt.has(k))byPt.set(k,[]); byPt.get(k).push({i,e}); }); });
       const usedS=new Array(segs.length).fill(false);
+      const edgeExtra=islandEdgeExtraDepth.has(isl.id)?islandEdgeExtraDepth.get(isl.id):params.edgeExtraDepth;
+      const edgeT=T+Math.max(0,edgeExtra||0), edgeInset=Math.min(bl,bh)*0.06;
       for(let i=0;i<segs.length;i++){
         if(usedS[i]) continue;
         const pts=[]; let cs=i, ce=0, guard=0;
@@ -416,12 +434,13 @@ function build(){
         for(let p=0;p<pts.length-1;p++){
           const a=pts[p], b=pts[p+1], dx=b[0]-a[0], dy=b[1]-a[1], len=Math.hypot(dx,dy); if(len<1e-6) continue;
           const ang=Math.atan2(dy,dx);
-          let nx=-dy/len, ny=dx/len;                                  // unit perpendicular to this boundary edge
-          if(!inIsland((a[0]+b[0])/2 + nx*bh*0.6, (a[1]+b[1])/2 + ny*bh*0.6)){ nx=-nx; ny=-ny; }   // aim it INWARD, into the face
-          const ox=nx*bh*0.5, oy=ny*bh*0.5;                           // inset the course half a brick so it sits inside the outline (no overhang onto neighbours)
+          let nx=-dy/len, ny=dx/len;
+          if(!inIsland((a[0]+b[0])/2+nx*bh*0.6,(a[1]+b[1])/2+ny*bh*0.6)){ nx=-nx; ny=-ny; }
+          const ox=nx*bh*0.5, oy=ny*bh*0.5;                           // sit the course half a brick inside the outline
           while(nextAt<=dist+len){
             const f=(nextAt-dist)/len, ca=a[0]+dx*f+ox, cb=a[1]+dy*f+oy;
-            placeIslandEdgeBrick(P,u,v,N,ca,cb,bl,bh,ang);
+            const clipped=clipToBoundary(localBrickRect(ca,cb,bl,bh,ang), edgeInset);
+            if(clipped){ const geo=prismFromLocalPoly(P,u,v,N,clipped,edgeT,SKIN); if(geo){ rememberClipGeo(geo); clipBrickCount++; } }
             nextAt+=bl;
           }
           dist+=len;
@@ -834,7 +853,7 @@ function reprocessImport(name){
   const ctr=new THREE.Vector3(); geo.boundingBox.getCenter(ctr);
   geo.translate(-ctr.x, -geo.boundingBox.min.y, -ctr.z);     // centre x/z, base on the ground
   if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); }
-  importedMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1, side:THREE.DoubleSide }));
+  importedMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1, side:THREE.DoubleSide, polygonOffset:true, polygonOffsetFactor:1.5, polygonOffsetUnits:1.5 }));   // push the core a touch back in the depth buffer so bricks never z-fight it
   importedMesh.castShadow=true; importedMesh.receiveShadow=true;
   scene.add(importedMesh);
   computeIslands(geo);
