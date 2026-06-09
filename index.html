@@ -212,6 +212,7 @@ const roofMat  = new THREE.MeshStandardMaterial({ color:0x3a2c24, roughness:1 })
 
 let brickMesh=null, coreMesh=null, roofMesh=null;
 let lastMatrices=[], lastBrickGeo=null, importedMesh=null;
+let lastIslandMats=new Map();   // island id -> [Matrix4] for per-face STL export (ZBrush subtools)
 
 function build(){
   if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); if(brickMesh.dispose) brickMesh.dispose(); }
@@ -226,6 +227,7 @@ function build(){
   const base = new THREE.Color(params.color);
 
   const mats=[], cols=[];
+  let _curIslId=-1;            // which island the next placeIslandBrick() belongs to (for per-face export)
   const NORMAL_Z=new THREE.Vector3(0,0,1);
   const FRAME_PROUD = T*0.18;  // frame course only barely proud — enough to cap the seam, not extrude
 
@@ -301,11 +303,14 @@ function build(){
     if(phi) q.multiply(new THREE.Quaternion().setFromAxisAngle(NORMAL_Z, phi));
     if(rotMax>0) q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax)));
     const sj=1+(rnd()-0.5)*0.12*params.randomness;
-    mats.push(new THREE.Matrix4().compose(p3,q,new THREE.Vector3(bl*sj,bh*sj,T)));
+    const M=new THREE.Matrix4().compose(p3,q,new THREE.Vector3(bl*sj,bh*sj,T));
+    mats.push(M);
+    if(_curIslId>=0){ const arr=lastIslandMats.get(_curIslId); if(arr) arr.push(M); }   // track for per-face STL export
     const c=base.clone(); c.multiplyScalar(1+(rnd()-0.5)*0.35*Math.max(0.25,params.randomness)); cols.push(c);
   }
   // brick ONE normal-island: field bricks (per-face density) + an edge course framing its outline + holes
   function brickIsland(isl){
+    _curIslId=isl.id; lastIslandMats.set(isl.id, []);          // start this face's own matrix list (per-face STL)
     const dens=(islandDensity.get(isl.id)||1)*(params.globalDensity||1), bl=L/dens, bh=Hb/dens;
     const N=isl.normal.clone();
     let v=new THREE.Vector3(0,1,0).addScaledVector(N,-N.y);    // world-up projected into the face plane
@@ -316,15 +321,21 @@ function build(){
     const tris2=[]; let minA=1e9,maxA=-1e9,minB=1e9,maxB=-1e9;
     for(const t of isl.tris){ const tri=[]; for(let k=0;k<3;k++){ tmp.fromBufferAttribute(pos,t*3+k).sub(P); const a=tmp.dot(u),b=tmp.dot(v); tri.push([a,b]); if(a<minA)minA=a;if(a>maxA)maxA=a;if(b<minB)minB=b;if(b>maxB)maxB=b; } tris2.push(tri); }
     const stepU=bl+g, stepV=bh+g; let row=0;
+    const tb=tris2.map(t=>[Math.min(t[0][0],t[1][0],t[2][0]),Math.max(t[0][0],t[1][0],t[2][0]),Math.min(t[0][1],t[1][1],t[2][1]),Math.max(t[0][1],t[1][1],t[2][1])]);
+    const inIsland=(a,b)=>{ for(let i=0;i<tris2.length;i++){ const x=tb[i]; if(a<x[0]||a>x[1]||b<x[2]||b>x[3]) continue; if(pointInTri2D(a,b,tris2[i])) return true; } return false; };
+    // FIELD: each brick CLIPPED to the face outline (closure bricks -> fills to the edge, never overhangs)
     for(let bb=minB; bb<maxB; bb+=stepV, row++){
       const off=(row%2)*(stepU/2);
       for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
-        const ca=aa+bl/2, cb=bb+bh/2;
-        let inside=false; for(const tt of tris2){ if(pointInTri2D(ca,cb,tt)){ inside=true; break; } }
-        if(inside) placeIslandBrick(P,u,v,N, ca,cb, bl,bh, 0, 0);
+        const a0=aa,b0=bb, NX=5,NY=3; let mnA=1e9,mxA=-1e9,mnB=1e9,mxB=-1e9,any=false;
+        for(let ix=0;ix<NX;ix++)for(let jy=0;jy<NY;jy++){ const sa=a0+(ix+0.5)/NX*bl, sb=b0+(jy+0.5)/NY*bh;
+          if(inIsland(sa,sb)){ any=true; if(sa<mnA)mnA=sa;if(sa>mxA)mxA=sa;if(sb<mnB)mnB=sb;if(sb>mxB)mxB=sb; } }
+        if(!any) continue;
+        const cw=mxA-mnA, ch=mxB-mnB; if(cw<bl*0.12||ch<bh*0.12) continue;
+        placeIslandBrick(P,u,v,N, (mnA+mxA)/2, (mnB+mxB)/2, cw, ch, 0, 0);
       }
     }
-    // EDGE COURSE: chain boundary into loops, march each placing a brick every ~bl (even spacing on curves)
+    // EDGE COURSE: chain boundary into loops, march evenly, INSET inward so it sits inside the face
     if(isl.boundary && isl.boundary.length){
       const segs=isl.boundary.map(s=>{ const a=new THREE.Vector3().copy(s[0]).sub(P); const b=new THREE.Vector3().copy(s[1]).sub(P); return [[a.dot(u),a.dot(v)],[b.dot(u),b.dot(v)]]; });
       const qk=p=>Math.round(p[0]*400)+'|'+Math.round(p[1]*400);
@@ -343,7 +354,10 @@ function build(){
         for(let p=0;p<pts.length-1;p++){
           const a=pts[p], b=pts[p+1], dx=b[0]-a[0], dy=b[1]-a[1], len=Math.hypot(dx,dy); if(len<1e-6) continue;
           const ang=Math.atan2(dy,dx);
-          while(nextAt<=dist+len){ const f=(nextAt-dist)/len; placeIslandBrick(P,u,v,N, a[0]+dx*f, a[1]+dy*f, bl,bh, ang, bh*0.35); nextAt+=bl; }
+          let nx=-dy/len, ny=dx/len;                                  // unit perpendicular to this boundary edge
+          if(!inIsland((a[0]+b[0])/2 + nx*bh*0.6, (a[1]+b[1])/2 + ny*bh*0.6)){ nx=-nx; ny=-ny; }   // aim it INWARD, into the face
+          const ox=nx*bh*0.5, oy=ny*bh*0.5;                           // inset the course half a brick so it sits inside the outline (no overhang onto neighbours)
+          while(nextAt<=dist+len){ const f=(nextAt-dist)/len; placeIslandBrick(P,u,v,N, a[0]+dx*f+ox, a[1]+dy*f+oy, bl,bh, ang, bh*0.35); nextAt+=bl; }
           dist+=len;
         }
       }
@@ -351,6 +365,7 @@ function build(){
   }
 
   if(importedMesh){
+    lastIslandMats.clear();
     for(const isl of importedIslands) if(selectedIslands.has(isl.id)) brickIsland(isl);
   } else
   for(const wall of walls){
@@ -452,6 +467,29 @@ function exportSTL(){
   a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   merged.dispose();
+}
+
+// ---------- Per-face STL (one normal-island = one ZBrush subtool) ----------
+function faceSTLBlob(islId){
+  const arr=lastIslandMats.get(islId); if(!arr||!arr.length) return null;
+  const geoms=[];
+  for(const mat of arr){ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); geoms.push(gg); }
+  const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
+  const data=new STLExporter().parse(new THREE.Mesh(merged),{binary:true});
+  merged.dispose();
+  return new Blob([data],{type:'application/octet-stream'});
+}
+function downloadBlob(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
+function exportFaceSTL(){
+  if(focusedIsland<0){ alert('Click a face first (it turns yellow), then export it.'); return; }
+  const b=faceSTLBlob(focusedIsland);
+  if(!b){ alert('That face has no bricks yet — make sure it is switched on (green).'); return; }
+  downloadBlob(b,'face_'+focusedIsland+'.stl');
+}
+function exportAllFaces(){
+  const ids=[...selectedIslands].filter(id=>{ const a=lastIslandMats.get(id); return a&&a.length; });
+  if(!ids.length){ alert('No bricked faces to export — select some faces first.'); return; }
+  ids.forEach((id,k)=> setTimeout(()=>{ const b=faceSTLBlob(id); if(b) downloadBlob(b,'face_'+id+'.stl'); }, k*350));   // stagger so the browser allows the multi-file download
 }
 
 // debounce rebuilds so dragging a slider doesn't run the boolean on every tick
@@ -646,6 +684,8 @@ fIm.add({ clr:()=>{ selectedIslands.clear(); islandDensity.clear(); focusedIslan
 params.globalDensity=1; params.faceDensity=1;
 fIm.add(params,'globalDensity',0.4,3,0.05).name('Global density ×').onChange(()=>{ if(importedMesh) build(); });
 faceDensCtrl = fIm.add(params,'faceDensity',0.3,3,0.05).name('Clicked-face density ×').onChange(v=>{ if(focusedIsland>=0){ islandDensity.set(focusedIsland,v); build(); } });
+fIm.add({ ef: exportFaceSTL }, 'ef').name('⬇  Export clicked face (STL)');
+fIm.add({ ea: exportAllFaces }, 'ea').name('⬇  Export each face separately (ZBrush)');
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
