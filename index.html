@@ -429,28 +429,42 @@ fileInput.addEventListener('change', e=>{
   reader.readAsArrayBuffer(f);
   fileInput.value='';
 });
-function loadSTL(buffer, name){
-  const geo = stlLoader.parse(buffer);
-  geo.computeVertexNormals();
-  geo.center();
-  geo.computeBoundingBox();
-  const size=new THREE.Vector3(); geo.boundingBox.getSize(size);
-  const s = 4.0 / Math.max(size.x, size.y, size.z);          // fit largest dimension to ~4 units
-  geo.scale(s,s,s);
+let importedGeoRaw=null;                  // parsed geometry, centred at origin, before rotation/fit
+const importRot={x:0,y:0,z:0};            // accumulated 90° turns
+function reprocessImport(name){
+  if(!importedGeoRaw) return;
+  const geo = importedGeoRaw.clone();
+  if(importRot.x) geo.rotateX(importRot.x*Math.PI/2);
+  if(importRot.y) geo.rotateY(importRot.y*Math.PI/2);
+  if(importRot.z) geo.rotateZ(importRot.z*Math.PI/2);
+  geo.computeBoundingBox(); const size=new THREE.Vector3(); geo.boundingBox.getSize(size);
+  geo.scale(4.0/Math.max(size.x,size.y,size.z), 4.0/Math.max(size.x,size.y,size.z), 4.0/Math.max(size.x,size.y,size.z));
   geo.computeBoundingBox(); geo.boundingBox.getSize(size);
-  geo.translate(0, size.y/2, 0);                              // sit it on the ground
+  const ctr=new THREE.Vector3(); geo.boundingBox.getCenter(ctr);
+  geo.translate(-ctr.x, -geo.boundingBox.min.y, -ctr.z);     // centre x/z, base on the ground
   if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); }
   importedMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1, side:THREE.DoubleSide }));
   importedMesh.castShadow=true; importedMesh.receiveShadow=true;
   scene.add(importedMesh);
-  params.width=size.x; params.depth=size.z; params.height=size.y;   // clad its bounding box
+  params.width=size.x; params.depth=size.z; params.height=size.y;
   build();
-  document.getElementById('info').innerHTML = '<b>Imported:</b> '+(name||'model.stl')+'<br>Bricks clad its bounding box. Hit <b>Use sample building</b> to go back.';
+  if(name) document.getElementById('info').innerHTML = '<b>Imported:</b> '+name+'<br>Use <b>Rotate X/Y/Z</b> to stand it up, then tune the bricks.';
+}
+function loadSTL(buffer, name){
+  const geo = stlLoader.parse(buffer);
+  geo.computeVertexNormals();
+  geo.center();
+  importedGeoRaw = geo;
+  importRot.x=0; importRot.y=0; importRot.z=0;
+  reprocessImport(name||'model.stl');
 }
 function loadExample(){ fetch('sample-building.stl').then(r=>r.arrayBuffer()).then(b=>loadSTL(b,'example building')).catch(e=>{ console.error(e); alert('Could not load the example building file.'); }); }
 const fIm = gui.addFolder('Import');
 fIm.add({ pick: ()=>fileInput.click() }, 'pick').name('⬆  Import STL…');
 fIm.add({ ex: loadExample }, 'ex').name('🏠  Load example building');
+fIm.add({ rx: ()=>{ importRot.x=(importRot.x+1)%4; reprocessImport(); } }, 'rx').name('⟳  Rotate X 90°');
+fIm.add({ ry: ()=>{ importRot.y=(importRot.y+1)%4; reprocessImport(); } }, 'ry').name('⟳  Rotate Y 90°');
+fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz').name('⟳  Rotate Z 90°');
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
