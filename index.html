@@ -205,19 +205,30 @@ function borderFor(op, L, Hb, g){
 
 // ---------- Build ----------
 const unitBox = new THREE.BoxGeometry(1,1,1);
+function bakedBoxGeometry(mat){
+  const gg=unitBox.clone().toNonIndexed();
+  if(gg.attributes.uv) gg.deleteAttribute('uv');
+  gg.applyMatrix4(mat);
+  return gg;
+}
 const brickMat = new THREE.MeshStandardMaterial({ color:0xffffff, roughness:0.93, metalness:0.0 });
 const csgMat = new THREE.MeshStandardMaterial({ color:0xb05a34, roughness:0.93, metalness:0.0 });
 const coreMat  = new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1 });
 const roofMat  = new THREE.MeshStandardMaterial({ color:0x3a2c24, roughness:1 });
 
-let brickMesh=null, coreMesh=null, roofMesh=null;
-let lastMatrices=[], lastBrickGeo=null, importedMesh=null;
-let lastIslandMats=new Map();   // island id -> [Matrix4] for per-face STL export (ZBrush subtools)
+let brickMesh=null, clipBrickMesh=null, coreMesh=null, roofMesh=null;
+let lastMatrices=[], lastBrickGeo=null, lastClipGeo=null, importedMesh=null;
+let lastIslandMats=new Map();       // island id -> [Matrix4] for per-face STL export (ZBrush subtools)
+let lastIslandClipGeoms=new Map();  // island id -> clipped edge geometries for per-face STL export
 
 function build(){
   if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); if(brickMesh.dispose) brickMesh.dispose(); }
+  if(clipBrickMesh){ scene.remove(clipBrickMesh); clipBrickMesh.geometry.dispose(); }
   if(coreMesh){ scene.remove(coreMesh); coreMesh.geometry.dispose(); }
   if(roofMesh){ scene.remove(roofMesh); roofMesh.geometry.dispose(); }
+  for(const arr of lastIslandClipGeoms.values()) for(const g of arr) g.dispose();
+  lastIslandClipGeoms.clear();
+  clipBrickMesh=null; lastClipGeo=null;
 
   const walls = buildWalls();
   const L=params.brickLength, Hb=params.brickHeight, T=params.brickDepth, g=params.mortarGap;
@@ -226,9 +237,18 @@ function build(){
   const rotMax = params.rotation * THREE.MathUtils.degToRad(16);
   const base = new THREE.Color(params.color);
 
-  const mats=[], cols=[];
+  const mats=[], cols=[], clipGeoms=[];
+  let clipBrickCount=0;
   let _curIslId=-1;            // which island the next placeIslandBrick() belongs to (for per-face export)
   const NORMAL_Z=new THREE.Vector3(0,0,1);
+  function rememberClipGeo(geo){
+    clipGeoms.push(geo);
+    if(_curIslId>=0){
+      let arr=lastIslandClipGeoms.get(_curIslId);
+      if(!arr){ arr=[]; lastIslandClipGeoms.set(_curIslId, arr); }
+      arr.push(geo);
+    }
+  }
   const FRAME_PROUD = T*0.18;  // frame course only barely proud — enough to cap the seam, not extrude
 
   // place a brick: (cu,cv) wall-local centre, (sx,sy) in-plane size, phi = length-axis angle,
@@ -323,10 +343,9 @@ function build(){
     const stepU=bl+g, stepV=bh+g; let row=0;
     const tb=tris2.map(t=>[Math.min(t[0][0],t[1][0],t[2][0]),Math.max(t[0][0],t[1][0],t[2][0]),Math.min(t[0][1],t[1][1],t[2][1]),Math.max(t[0][1],t[1][1],t[2][1])]);
     const inIsland=(a,b)=>{ for(let i=0;i<tris2.length;i++){ const x=tb[i]; if(a<x[0]||a>x[1]||b<x[2]||b>x[3]) continue; if(pointInTri2D(a,b,tris2[i])) return true; } return false; };
-    // FIELD: a cell fully inside the face gets a FULL-size brick (so mortar gap 0 => bricks touch, no false gaps);
-    //        a cell straddling the outline gets a CLOSURE brick clipped to the inside samples only (trims UNDER the
-    //        surface, never pokes past it). m = a hair of extra inset on closures so no edge shows on the original mesh.
-    const NX=6,NY=4, m=bl*0.04;
+    // FIELD: full cells stay full-size. Edge cells are clipped against the real STL triangles instead
+    // of using sample-point shrink boxes, so roof/window edges fill cleanly without spilling onto neighbours.
+    const NX=6,NY=4, edgeInset=Math.min(bl,bh)*0.015;
     for(let bb=minB; bb<maxB; bb+=stepV, row++){
       const off=(row%2)*(stepU/2);
       for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
@@ -335,8 +354,19 @@ function build(){
           if(inIsland(sa,sb)){ cnt++; if(sa<mnA)mnA=sa;if(sa>mxA)mxA=sa;if(sb<mnB)mnB=sb;if(sb>mxB)mxB=sb; } }
         if(!cnt) continue;
         let lA,hA,lB,hB;
-        if(cnt===NX*NY){ lA=a0; hA=a0+bl; lB=b0; hB=b0+bh; }                  // fully inside -> FULL brick (no gap)
-        else { lA=mnA+m; hA=mxA-m; lB=mnB+m*0.5; hB=mxB-m*0.5; }              // edge -> clip inside + trim a touch more
+        const fullCell=cnt===NX*NY && inIsland(a0,b0) && inIsland(a0+bl,b0) && inIsland(a0+bl,b0+bh) && inIsland(a0,b0+bh);
+        if(fullCell){ lA=a0; hA=a0+bl; lB=b0; hB=b0+bh; }                    // fully inside -> FULL brick (no gap)
+        else {
+          const parts=clippedBrickParts(a0,b0,a0+bl,b0+bh,tris2,edgeInset);
+          let made=false;
+          for(const poly of parts){
+            const geo=prismFromLocalPoly(P,u,v,N,poly,T,0);
+            if(!geo) continue;
+            rememberClipGeo(geo); made=true;
+          }
+          if(made) clipBrickCount++;
+          continue;
+        }
         const cw=hA-lA, ch=hB-lB; if(cw<bl*0.1||ch<bh*0.1) continue;
         placeIslandBrick(P,u,v,N, (lA+hA)/2, (lB+hB)/2, cw, ch, 0, 0);
       }
@@ -363,7 +393,18 @@ function build(){
           let nx=-dy/len, ny=dx/len;                                  // unit perpendicular to this boundary edge
           if(!inIsland((a[0]+b[0])/2 + nx*bh*0.6, (a[1]+b[1])/2 + ny*bh*0.6)){ nx=-nx; ny=-ny; }   // aim it INWARD, into the face
           const ox=nx*bh*0.5, oy=ny*bh*0.5;                           // inset the course half a brick so it sits inside the outline (no overhang onto neighbours)
-          while(nextAt<=dist+len){ const f=(nextAt-dist)/len; placeIslandBrick(P,u,v,N, a[0]+dx*f+ox, a[1]+dy*f+oy, bl,bh, ang, bh*0.35); nextAt+=bl; }
+          while(nextAt<=dist+len){
+            const f=(nextAt-dist)/len, ca=a[0]+dx*f+ox, cb=a[1]+dy*f+oy;
+            const parts=clippedPolyParts(localBrickRect(ca,cb,bl,bh,ang),tris2,edgeInset);
+            let made=false;
+            for(const poly of parts){
+              const geo=prismFromLocalPoly(P,u,v,N,poly,T,0);
+              if(!geo) continue;
+              rememberClipGeo(geo); made=true;
+            }
+            if(made) clipBrickCount++;
+            nextAt+=bl;
+          }
           dist+=len;
         }
       }
@@ -404,9 +445,19 @@ function build(){
     }
   }
 
-  const count = mats.length;
+  const count = mats.length + clipBrickCount;
   lastMatrices = mats;
   if(count===0){ brickMesh=null; lastBrickGeo=null; }
+  else if(importedMesh && clipGeoms.length){
+    const geoms=[];
+    for(let i=0;i<mats.length;i++) geoms.push(bakedBoxGeometry(mats[i]));
+    geoms.push(...clipGeoms);
+    const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
+    csgMat.color.set(params.color);
+    brickMesh=new THREE.Mesh(merged,csgMat);
+    brickMesh.castShadow=true; brickMesh.receiveShadow=true;
+    lastBrickGeo=merged; scene.add(brickMesh);
+  }
   else if(csgReady){
     // merge all bricks (with per-brick vertex colour), then boolean-subtract each opening -> clean curved edges
     const geoms=[];
@@ -422,12 +473,21 @@ function build(){
     res.material=csgMat; res.castShadow=true; res.receiveShadow=true;
     brickMesh=res; lastBrickGeo=res.geometry; scene.add(brickMesh);
   } else {
-    brickMesh = new THREE.InstancedMesh(unitBox, brickMat, count);
-    brickMesh.castShadow = true; brickMesh.receiveShadow = true;
-    for(let i=0;i<count;i++){ brickMesh.setMatrixAt(i,mats[i]); brickMesh.setColorAt(i,cols[i]); }
-    brickMesh.instanceMatrix.needsUpdate = true;
-    if(brickMesh.instanceColor) brickMesh.instanceColor.needsUpdate = true;
-    lastBrickGeo=null; scene.add(brickMesh);
+    if(mats.length){
+      brickMesh = new THREE.InstancedMesh(unitBox, brickMat, mats.length);
+      brickMesh.castShadow = true; brickMesh.receiveShadow = true;
+      for(let i=0;i<mats.length;i++){ brickMesh.setMatrixAt(i,mats[i]); brickMesh.setColorAt(i,cols[i]); }
+      brickMesh.instanceMatrix.needsUpdate = true;
+      if(brickMesh.instanceColor) brickMesh.instanceColor.needsUpdate = true;
+      scene.add(brickMesh);
+    } else brickMesh=null;
+    lastBrickGeo=null;
+    if(clipGeoms.length){
+      lastClipGeo=BufferGeometryUtils.mergeGeometries(clipGeoms,false);
+      clipBrickMesh=new THREE.Mesh(lastClipGeo,csgMat);
+      clipBrickMesh.castShadow=true; clipBrickMesh.receiveShadow=true;
+      scene.add(clipBrickMesh);
+    }
   }
 
   if(importedMesh){
@@ -459,6 +519,7 @@ function exportSTL(){
     const b=lastBrickGeo.clone(); if(b.attributes.color) b.deleteAttribute('color'); if(b.attributes.uv) b.deleteAttribute('uv'); geoms.push(b);
   } else {
     for(const mat of lastMatrices){ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); geoms.push(gg); }
+    if(lastClipGeo){ const cg=lastClipGeo.clone(); if(cg.attributes.color) cg.deleteAttribute('color'); if(cg.attributes.uv) cg.deleteAttribute('uv'); geoms.push(cg); }
   }
   const cg=new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET);
   cg.translate(0, params.height/2, 0); if(cg.attributes.uv) cg.deleteAttribute('uv');
@@ -477,9 +538,11 @@ function exportSTL(){
 
 // ---------- Per-face STL (one normal-island = one ZBrush subtool) ----------
 function faceSTLBlob(islId){
-  const arr=lastIslandMats.get(islId); if(!arr||!arr.length) return null;
+  const arr=lastIslandMats.get(islId)||[], clipped=lastIslandClipGeoms.get(islId)||[];
+  if(!arr.length&&!clipped.length) return null;
   const geoms=[];
-  for(const mat of arr){ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); geoms.push(gg); }
+  for(const mat of arr) geoms.push(clipped.length ? bakedBoxGeometry(mat) : (()=>{ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); return gg; })());
+  for(const src of clipped){ const gg=src.clone(); if(gg.attributes.color) gg.deleteAttribute('color'); if(gg.attributes.uv) gg.deleteAttribute('uv'); geoms.push(gg); }
   const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
   const data=new STLExporter().parse(new THREE.Mesh(merged),{binary:true});
   merged.dispose();
@@ -493,7 +556,7 @@ function exportFaceSTL(){
   downloadBlob(b,'face_'+focusedIsland+'.stl');
 }
 function exportAllFaces(){
-  const ids=[...selectedIslands].filter(id=>{ const a=lastIslandMats.get(id); return a&&a.length; });
+  const ids=[...selectedIslands].filter(id=>{ const a=lastIslandMats.get(id), b=lastIslandClipGeoms.get(id); return (a&&a.length)||(b&&b.length); });
   if(!ids.length){ alert('No bricked faces to export — select some faces first.'); return; }
   ids.forEach((id,k)=> setTimeout(()=>{ const b=faceSTLBlob(id); if(b) downloadBlob(b,'face_'+id+'.stl'); }, k*350));   // stagger so the browser allows the multi-file download
 }
@@ -547,6 +610,86 @@ function pointInTri2D(px,py,t){
   const wa=((b[1]-c[1])*(px-c[0])+(c[0]-b[0])*(py-c[1]))/d;
   const wb=((c[1]-a[1])*(px-c[0])+(a[0]-c[0])*(py-c[1]))/d;
   return wa>=-0.001 && wb>=-0.001 && (1-wa-wb)>=-0.001;
+}
+function polyArea2D(poly){
+  let a=0;
+  for(let i=0;i<poly.length;i++){ const p=poly[i], q=poly[(i+1)%poly.length]; a+=p[0]*q[1]-q[0]*p[1]; }
+  return a*0.5;
+}
+function clipLine2D(s,e,a,b){
+  const dx=e[0]-s[0], dy=e[1]-s[1], ex=b[0]-a[0], ey=b[1]-a[1];
+  const den=dx*ey-dy*ex;
+  if(Math.abs(den)<1e-10) return [e[0],e[1]];
+  const t=((a[0]-s[0])*ey-(a[1]-s[1])*ex)/den;
+  return [s[0]+dx*t, s[1]+dy*t];
+}
+function clipPolyHalfPlane(poly,a,b,sign){
+  const out=[];
+  const inside=p=>sign*((b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0]))>=-1e-7;
+  for(let i=0;i<poly.length;i++){
+    const s=poly[i], e=poly[(i+1)%poly.length], si=inside(s), ei=inside(e);
+    if(si&&ei) out.push(e);
+    else if(si&&!ei) out.push(clipLine2D(s,e,a,b));
+    else if(!si&&ei){ out.push(clipLine2D(s,e,a,b)); out.push(e); }
+  }
+  return out;
+}
+function clipPolyToTri(poly,tri){
+  let out=poly;
+  const sign=polyArea2D(tri)>=0 ? 1 : -1;
+  for(let i=0;i<3&&out.length;i++) out=clipPolyHalfPlane(out,tri[i],tri[(i+1)%3],sign);
+  return out;
+}
+function insetPolyTowardCenter(poly,inset){
+  if(!inset||poly.length<3) return poly;
+  const c=poly.reduce((p,q)=>[p[0]+q[0],p[1]+q[1]],[0,0]).map(v=>v/poly.length);
+  const out=poly.map(p=>{
+    const dx=c[0]-p[0], dy=c[1]-p[1], d=Math.hypot(dx,dy);
+    if(d<1e-8) return p;
+    const step=Math.min(inset,d*0.35);
+    return [p[0]+dx/d*step, p[1]+dy/d*step];
+  });
+  return Math.abs(polyArea2D(out))>1e-7 ? out : poly;
+}
+function clippedPolyParts(sourcePoly,tris2,inset){
+  const out=[];
+  for(const tri of tris2){
+    let poly=clipPolyToTri(sourcePoly,tri);
+    if(poly.length<3 || Math.abs(polyArea2D(poly))<1e-6) continue;
+    poly=insetPolyTowardCenter(poly,inset);
+    if(poly.length>=3 && Math.abs(polyArea2D(poly))>=1e-6) out.push(poly);
+  }
+  return out;
+}
+function clippedBrickParts(a0,b0,a1,b1,tris2,inset){
+  return clippedPolyParts([[a0,b0],[a1,b0],[a1,b1],[a0,b1]],tris2,inset);
+}
+function localBrickRect(ca,cb,w,h,phi){
+  const ux=Math.cos(phi), uy=Math.sin(phi), vx=-uy, vy=ux, hw=w/2, hh=h/2;
+  return [
+    [ca-ux*hw-vx*hh, cb-uy*hw-vy*hh],
+    [ca+ux*hw-vx*hh, cb+uy*hw-vy*hh],
+    [ca+ux*hw+vx*hh, cb+uy*hw+vy*hh],
+    [ca-ux*hw+vx*hh, cb-uy*hw+vy*hh]
+  ];
+}
+function prismFromLocalPoly(P,u,v,N,poly,depth,proud){
+  if(poly.length<3 || Math.abs(polyArea2D(poly))<1e-6) return null;
+  if(polyArea2D(poly)<0) poly=[...poly].reverse();
+  const positions=[];
+  const pt=(p,z)=>new THREE.Vector3().copy(P).addScaledVector(u,p[0]).addScaledVector(v,p[1]).addScaledVector(N,z);
+  const push=(a,b,c)=>positions.push(a.x,a.y,a.z,b.x,b.y,b.z,c.x,c.y,c.z);
+  const back=poly.map(p=>pt(p,proud)), front=poly.map(p=>pt(p,proud+depth));
+  for(let i=1;i<poly.length-1;i++){ push(front[0],front[i],front[i+1]); push(back[0],back[i+1],back[i]); }
+  for(let i=0;i<poly.length;i++){
+    const j=(i+1)%poly.length;
+    push(back[i],back[j],front[j]);
+    push(back[i],front[j],front[i]);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+  geo.computeVertexNormals();
+  return geo;
 }
 function computeIslands(geo){
   const pos=geo.attributes.position, triCount=(pos.count/3)|0;
